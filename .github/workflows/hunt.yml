@@ -1,0 +1,84 @@
+name: Grab free ARM (A1.Flex)
+
+# Polls Oracle Cloud every ~10 minutes and launches the free Always-Free
+# ARM instance the moment Singapore has capacity. Stops launching once an
+# instance named "storetrack" exists, and opens an issue to notify you.
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"   # every 10 minutes (UTC)
+  workflow_dispatch: {}       # allow manual runs from the Actions tab
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: oci-arm-hunt
+  cancel-in-progress: false
+
+jobs:
+  hunt:
+    runs-on: ubuntu-latest
+    env:
+      # OCI CLI reads these env vars directly (keyless auth, no config file).
+      OCI_CLI_USER: ${{ secrets.OCI_CLI_USER }}
+      OCI_CLI_TENANCY: ${{ secrets.OCI_CLI_TENANCY }}
+      OCI_CLI_FINGERPRINT: ${{ secrets.OCI_CLI_FINGERPRINT }}
+      OCI_CLI_KEY_CONTENT: ${{ secrets.OCI_CLI_KEY_CONTENT }}
+      OCI_CLI_REGION: ${{ secrets.OCI_CLI_REGION }}
+      SUPPRESS_LABEL_WARNING: "True"
+      AD: "jpjp:AP-SINGAPORE-1-AD-1"
+      SHAPE: "VM.Standard.A1.Flex"
+      SHAPE_CONFIG: '{"ocpus": 2, "memoryInGBs": 12}'
+      NAME: "storetrack"
+    steps:
+      - name: Install OCI CLI
+        run: pip install --quiet oci-cli
+
+      - name: Attempt launch
+        id: launch
+        run: |
+          set -uo pipefail
+          TENANCY="$OCI_CLI_TENANCY"
+          SUBNET="${{ secrets.OCI_SUBNET_ID }}"
+          IMAGE="${{ secrets.OCI_IMAGE_ID }}"
+          printf '%s\n' "${{ secrets.OCI_SSH_PUBKEY }}" > /tmp/id.pub
+
+          # Guard: if a non-terminated "storetrack" instance already exists, do nothing.
+          existing=$(oci --no-retry compute instance list --compartment-id "$TENANCY" \
+            --query "data[?\"display-name\"=='$NAME' && \"lifecycle-state\"!='TERMINATED'].id | [0]" \
+            --raw-output 2>/dev/null || true)
+          if [ -n "${existing:-}" ] && [ "$existing" != "null" ]; then
+            echo "Instance '$NAME' already exists ($existing). Nothing to do."
+            exit 0
+          fi
+
+          out=$(oci --no-retry compute instance launch \
+            --availability-domain "$AD" --compartment-id "$TENANCY" \
+            --shape "$SHAPE" --shape-config "$SHAPE_CONFIG" \
+            --image-id "$IMAGE" --subnet-id "$SUBNET" --assign-public-ip true \
+            --display-name "$NAME" --ssh-authorized-keys-file /tmp/id.pub 2>&1 || true)
+          echo "$out"
+
+          if echo "$out" | grep -q '"id": "ocid1.instance'; then
+            iid=$(echo "$out" | grep -m1 '"id": "ocid1.instance' | sed 's/.*: "\(.*\)".*/\1/')
+            echo "got_it=true" >> "$GITHUB_OUTPUT"
+            echo "iid=$iid" >> "$GITHUB_OUTPUT"
+          elif echo "$out" | grep -qiE "out of host capacity|too ?many ?requests|\"status\": 429"; then
+            echo "::notice::No ARM capacity yet (expected). Will retry next run."
+          else
+            echo "::error::Unexpected launch error (see log above)."
+            exit 1
+          fi
+
+      - name: Announce success
+        if: steps.launch.outputs.got_it == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          iid="${{ steps.launch.outputs.iid }}"
+          gh issue create \
+            --title "🎉 Free ARM instance acquired" \
+            --body "Launched instance \`$iid\` (VM.Standard.A1.Flex, 2 OCPU / 12 GB). Grab its public IP from the OCI console (Compute → Instances → storetrack) and migrate StoreTrack onto it. This workflow will now idle (the guard skips launching since the instance exists)." \
+            || echo "issue create failed (non-fatal)"
