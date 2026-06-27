@@ -7,7 +7,12 @@ name: Grab free ARM (A1.Flex)
 on:
   schedule:
     - cron: "*/10 * * * *"   # every 10 minutes (UTC)
-  workflow_dispatch: {}       # allow manual runs from the Actions tab
+  workflow_dispatch:
+    inputs:
+      test_notify:
+        description: "Post a test notification issue (as the bot) and exit — verifies the alert reaches you"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -33,11 +38,26 @@ jobs:
       SHAPE_CONFIG: '{"ocpus": 2, "memoryInGBs": 12}'
       NAME: "storetrack"
     steps:
+      - name: Notification self-test
+        if: ${{ inputs.test_notify }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          num=$(gh issue create -R "${{ github.repository }}" \
+            --title "🔔 Notification test (bot) — auto-closed" \
+            --assignee Nhi21pham \
+            --body "@Nhi21pham This issue was created by github-actions[bot], the exact actor and code path as the real '🎉 acquired' alert. If you received an email/notification for this, the real one will reach you too." \
+            | grep -oE '[0-9]+$')
+          gh issue close "$num" -R "${{ github.repository }}" --comment "Auto-closed: notification self-test complete."
+          echo "Created and closed test issue #$num as the bot."
+
       - name: Install OCI CLI
+        if: ${{ !inputs.test_notify }}
         run: pip install --quiet oci-cli
 
       - name: Attempt launch
         id: launch
+        if: ${{ !inputs.test_notify }}
         run: |
           set -uo pipefail
           TENANCY="$OCI_CLI_TENANCY"
@@ -80,5 +100,6 @@ jobs:
           iid="${{ steps.launch.outputs.iid }}"
           gh issue create \
             --title "🎉 Free ARM instance acquired" \
-            --body "Launched instance \`$iid\` (VM.Standard.A1.Flex, 2 OCPU / 12 GB). Grab its public IP from the OCI console (Compute → Instances → storetrack) and migrate StoreTrack onto it. This workflow will now idle (the guard skips launching since the instance exists)." \
+            --assignee Nhi21pham \
+            --body "@Nhi21pham Launched instance \`$iid\` (VM.Standard.A1.Flex, 2 OCPU / 12 GB). Grab its public IP from the OCI console (Compute → Instances → storetrack) and migrate StoreTrack onto it. This workflow will now idle (the guard skips launching since the instance exists)." \
             || echo "issue create failed (non-fatal)"
