@@ -92,14 +92,46 @@ jobs:
             exit 1
           fi
 
+      - name: Resolve public IP
+        id: ip
+        if: steps.launch.outputs.got_it == 'true'
+        run: |
+          set -uo pipefail
+          iid="${{ steps.launch.outputs.iid }}"
+          ip=""
+          # VNIC + public IP attach a little after launch; poll up to ~2 min.
+          for i in $(seq 1 24); do
+            ip=$(oci --no-retry compute instance list-vnics \
+              --instance-id "$iid" --compartment-id "$OCI_CLI_TENANCY" \
+              --query 'data[0]."public-ip"' --raw-output 2>/dev/null || true)
+            if [ -n "$ip" ] && [ "$ip" != "null" ]; then break; fi
+            sleep 5
+          done
+          echo "ip=$ip" >> "$GITHUB_OUTPUT"
+          echo "Public IP: ${ip:-<not ready — check OCI console>}"
+
       - name: Announce success
         if: steps.launch.outputs.got_it == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           iid="${{ steps.launch.outputs.iid }}"
+          ip="${{ steps.ip.outputs.ip }}"
+          [ -n "$ip" ] && [ "$ip" != "null" ] || ip="(not ready yet — see OCI console)"
+          printf '%s\n' \
+            "@Nhi21pham A free VM.Standard.A1.Flex (2 OCPU / 12 GB) just launched 🎉" \
+            "" \
+            "Public IP:     $ip" \
+            "SSH:           ssh ubuntu@$ip" \
+            "Instance OCID: $iid" \
+            "" \
+            "Next — migrate StoreTrack onto it. Step-by-step runbook:" \
+            "https://github.com/${{ github.repository }}/blob/main/MIGRATION.md" \
+            "" \
+            "This workflow now idles (the guard skips relaunching while the instance exists)." \
+            > /tmp/body.md
           gh issue create \
             --title "🎉 Free ARM instance acquired" \
             --assignee Nhi21pham \
-            --body "@Nhi21pham Launched instance \`$iid\` (VM.Standard.A1.Flex, 2 OCPU / 12 GB). Grab its public IP from the OCI console (Compute → Instances → storetrack) and migrate StoreTrack onto it. This workflow will now idle (the guard skips launching since the instance exists)." \
+            --body-file /tmp/body.md \
             || echo "issue create failed (non-fatal)"
